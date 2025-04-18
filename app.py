@@ -1,106 +1,135 @@
-import streamlit as st
-from streamlit_webrtc import webrtc_streamer, VideoTransformerBase
-import face_recognition
 import cv2
+import face_recognition
+import pickle
 import os
 from datetime import datetime
-import yagmail
-import geocoder
-from PIL import Image
+import numpy as np
+import serial
+import time
 
 # === CONFIGURATION ===
-EMAIL_SENDER = "arkjakki@gmail.com"
-EMAIL_PASSWORD = "kraq mohd igao kiyd"
-EMAIL_RECEIVER = "arkjakki@gmail.com"
+ENCODINGS_PATH = "encodings.pickle"
+SNAPSHOT_DIR = "detections"
+LABEL_SMOOTHING_FRAMES = 5
+MIN_FACE_SIZE = 80
+FRAME_SCALE = 0.5
+FACE_RESIZE_DIM = (150, 150)
+SERIAL_PORT = "COM8"
+BAUD_RATE = 9600
 
-# === Load Known Faces ===
-@st.cache_resource
-def load_known_faces():
-    known_encodings = []
-    known_names = []
-    dataset_path = 'dataset'
+# === Initialize Serial Communication ===
+try:
+    arduino = serial.Serial(SERIAL_PORT, BAUD_RATE)
+    time.sleep(2)
+    print(f"[INFO] Arduino connected on {SERIAL_PORT}")
+except:
+    arduino = None
+    print("[WARNING] Arduino not connected. Proceeding without it.")
 
-    for filename in os.listdir(dataset_path):
-        if filename.lower().endswith(('.jpg', '.jpeg', '.png')):
-            img_path = os.path.join(dataset_path, filename)
-            img = cv2.imread(img_path)
+last_color_sent = None
 
-            if img is None:
+# === Load Face Encodings ===
+def load_encodings():
+    with open(ENCODINGS_PATH, "rb") as file:
+        data = pickle.load(file)
+    return data["encodings"], data["names"]
+
+# === Save Detected Snapshot ===
+def save_snapshot(frame, name):
+    os.makedirs(SNAPSHOT_DIR, exist_ok=True)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    path = os.path.join(SNAPSHOT_DIR, f"{name}_{timestamp}.jpg")
+    cv2.imwrite(path, frame)
+    print(f"[INFO] Snapshot saved: {path}")
+
+# === Crop & Resize Detected Face ===
+def crop_and_resize_face(frame, location):
+    top, right, bottom, left = location
+    face = frame[max(0, top):min(frame.shape[0], bottom),
+                 max(0, left):min(frame.shape[1], right)]
+    if face.size == 0:
+        return None
+    return cv2.resize(face, FACE_RESIZE_DIM)
+
+# === MAIN FUNCTION ===
+def main():
+    known_encodings, known_names = load_encodings()
+    print("[INFO] Face encodings loaded.")
+
+    video = cv2.VideoCapture(0)
+    label_buffer = {}
+
+    global last_color_sent
+
+    while True:
+        ret, frame = video.read()
+        if not ret:
+            break
+
+        small_frame = cv2.resize(frame, (0, 0), fx=FRAME_SCALE, fy=FRAME_SCALE)
+        rgb_small_frame = cv2.cvtColor(small_frame, cv2.COLOR_BGR2RGB)
+        face_locations = face_recognition.face_locations(rgb_small_frame)
+
+        found_known_face = False
+
+        for face_location in face_locations:
+            top_s, right_s, bottom_s, left_s = face_location
+            top, right, bottom, left = [int(v / FRAME_SCALE) for v in [top_s, right_s, bottom_s, left_s]]
+
+            if (right - left) < MIN_FACE_SIZE or (bottom - top) < MIN_FACE_SIZE:
                 continue
 
-            encodings = face_recognition.face_encodings(img)
-            if encodings:
-                known_encodings.append(encodings[0])
-                name = os.path.splitext(filename)[0].split('(')[0].strip().upper()
-                known_names.append(name)
+            face_crop = crop_and_resize_face(frame, (top, right, bottom, left))
+            if face_crop is None:
+                continue
 
-    return known_encodings, known_names
+            rgb_face_crop = cv2.cvtColor(face_crop, cv2.COLOR_BGR2RGB)
+            face_encoding = face_recognition.face_encodings(rgb_face_crop)
+            if not face_encoding:
+                continue
+            face_encoding = face_encoding[0]
 
-known_encodings, known_names = load_known_faces()
-notified_names = set()
-
-
-# === Face Recognition Transformer for Streamlit ===
-class FaceRecognitionTransformer(VideoTransformerBase):
-    def transform(self, frame):
-        image = frame.to_ndarray(format="bgr24")
-        rgb_image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-        small_frame = cv2.resize(rgb_image, (0, 0), fx=0.25, fy=0.25)
-
-        face_locations = face_recognition.face_locations(small_frame)
-        face_encodings = face_recognition.face_encodings(small_frame, face_locations)
-
-        for face_encoding, face_location in zip(face_encodings, face_locations):
             matches = face_recognition.compare_faces(known_encodings, face_encoding)
             face_distances = face_recognition.face_distance(known_encodings, face_encoding)
-            best_match = face_distances.argmin() if len(face_distances) > 0 else None
+            best_match_index = np.argmin(face_distances) if face_distances.size else None
 
-            if best_match is not None and matches[best_match]:
-                name = known_names[best_match]
+            name = "Unknown"
 
-                if name not in notified_names:
-                    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                    g = geocoder.ip('me')
-                    location = g.city + ", " + g.country if g.ok else "Unknown"
+            if best_match_index is not None and matches[best_match_index]:
+                name = known_names[best_match_index]
+                found_known_face = True
+                save_snapshot(frame, name)
 
-                    # Save snapshot
-                    snapshot_name = f"{name}_{datetime.now().strftime('%H%M%S')}.jpg"
-                    cv2.imwrite(snapshot_name, image)
+            box_key = (top, right, bottom, left)
+            label_buffer.setdefault(box_key, []).append(name)
+            if len(label_buffer[box_key]) > LABEL_SMOOTHING_FRAMES:
+                label_buffer[box_key].pop(0)
+            stable_name = max(set(label_buffer[box_key]), key=label_buffer[box_key].count)
 
-                    try:
-                        yag = yagmail.SMTP(EMAIL_SENDER, EMAIL_PASSWORD)
-                        yag.send(
-                            to=EMAIL_RECEIVER,
-                            subject=f"Missing Person Found: {name}",
-                            contents=[
-                                f"Name: {name}",
-                                f"Time: {now}",
-                                f"Location: {location}",
-                                "Detected via Streamlit webcam.",
-                                snapshot_name
-                            ]
-                        )
-                        notified_names.add(name)
-                    except Exception as e:
-                        print(f"Email Error: {e}")
+            color = (0, 255, 0) if stable_name != "Unknown" else (0, 0, 255)
+            cv2.rectangle(frame, (left, top), (right, bottom), color, 2)
+            cv2.putText(frame, stable_name, (left, top - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.9, color, 2)
 
-                # Draw green box only for known face
-                top, right, bottom, left = [v * 4 for v in face_location]
-                cv2.rectangle(image, (left, top), (right, bottom), (0, 255, 0), 2)
-                cv2.putText(image, name, (left, top - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 255, 0), 2)
+        # === Arduino Control ===
+        if arduino:
+            if found_known_face:
+                if last_color_sent != 'A':
+                    arduino.write(b'A\n')
+                    last_color_sent = 'A'
+                    print("[DEBUG] Known face — Sent 'A'")
+            else:
+                if last_color_sent != 'O':
+                    arduino.write(b'O\n')
+                    last_color_sent = 'O'
+                    print("[DEBUG] No or Unknown face — Sent 'O'")
 
-        return image
+        cv2.imshow("Real-time Missing Person Detection", frame)
 
+        if cv2.waitKey(1) & 0xFF == ord('q'):
+            break
 
-# === Streamlit UI ===
-st.title("📷 Missing Person Detector (Real-Time)")
-st.markdown("✅ Check the box below to activate your webcam and start face recognition.")
+    video.release()
+    cv2.destroyAllWindows()
 
-start = st.checkbox("Start Webcam")
-
-if start:
-    webrtc_streamer(
-        key="face-detection",
-        video_transformer_factory=FaceRecognitionTransformer,
-        media_stream_constraints={"video": True, "audio": False},
-    )
+if __name__ == "__main__":
+    main()
