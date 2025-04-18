@@ -1,67 +1,68 @@
-import cv2
 import os
+import cv2
 import numpy as np
-from PIL import Image, ImageEnhance
 import random
+import face_recognition
 
-# === Root dataset folder ===
-dataset_root = "dataset"
+def apply_augmentations(image):
+    aug_list = []
 
-def apply_augmentations(img, idx, original_name, output_folder):
-    augmented = []
+    # Original
+    aug_list.append(image)
 
-    # 1. Blur
-    augmented.append(cv2.GaussianBlur(img, (5, 5), 0))
+    # Flip
+    aug_list.append(cv2.flip(image, 1))
 
-    # 2. Bright & Dark
-    pil_img = Image.fromarray(img)
-    bright = np.array(ImageEnhance.Brightness(pil_img).enhance(1.5))
-    dark = np.array(ImageEnhance.Brightness(pil_img).enhance(0.5))
-    augmented.extend([bright, dark])
+    # Bright/Dark
+    aug_list.append(cv2.convertScaleAbs(image, alpha=1.2, beta=30))
+    aug_list.append(cv2.convertScaleAbs(image, alpha=0.8, beta=-30))
 
-    # 3. Rotation
+    # Blur
+    aug_list.append(cv2.GaussianBlur(image, (5, 5), 0))
+
+    # Rotate
+    rows, cols, _ = image.shape
     for angle in [-10, 10]:
-        h, w = img.shape[:2]
-        M = cv2.getRotationMatrix2D((w // 2, h // 2), angle, 1)
-        rotated = cv2.warpAffine(img, M, (w, h))
-        augmented.append(rotated)
+        M = cv2.getRotationMatrix2D((cols / 2, rows / 2), angle, 1)
+        rotated = cv2.warpAffine(image, M, (cols, rows))
+        aug_list.append(rotated)
 
-    # 4. Flip
-    augmented.append(cv2.flip(img, 1))
+    # Noise
+    noise = np.random.normal(0, 25, image.shape).astype(np.uint8)
+    aug_list.append(cv2.add(image, noise))
 
-    # 5. Random Crop (Zoom)
-    h, w = img.shape[:2]
-    crop_size = int(0.9 * min(h, w))
-    x = random.randint(0, w - crop_size)
-    y = random.randint(0, h - crop_size)
-    crop = img[y:y+crop_size, x:x+crop_size]
-    augmented.append(cv2.resize(crop, (w, h)))
+    return aug_list
 
-    # 6. Noise
-    noise = img + np.random.normal(0, 25, img.shape).astype(np.uint8)
-    augmented.append(np.clip(noise, 0, 255))
+def augment_faces(input_dir="dataset", output_dir="augmented_dataset", crop_faces=True):
+    os.makedirs(output_dir, exist_ok=True)
 
-    # Save all
-    for i, aug in enumerate(augmented):
-        out_name = f"{os.path.splitext(original_name)[0]}_aug{i+1}_{idx}.jpg"
-        out_path = os.path.join(output_folder, out_name)
-        cv2.imwrite(out_path, aug)
+    for person in os.listdir(input_dir):
+        in_folder = os.path.join(input_dir, person)
+        out_folder = os.path.join(output_dir, person)
+        os.makedirs(out_folder, exist_ok=True)
 
-# === Process all folders ===
-for person_folder in os.listdir(dataset_root):
-    input_path = os.path.join(dataset_root, person_folder)
-    if os.path.isdir(input_path) and not person_folder.endswith("_augmented"):
-        output_path = os.path.join(dataset_root, f"{person_folder}_augmented")
-        os.makedirs(output_path, exist_ok=True)
+        for img_name in os.listdir(in_folder):
+            img_path = os.path.join(in_folder, img_name)
+            image = cv2.imread(img_path)
 
-        print(f"📁 Processing {person_folder}...")
+            if crop_faces:
+                # Crop only faces
+                face_locations = face_recognition.face_locations(image)
+                for i, loc in enumerate(face_locations):
+                    top, right, bottom, left = loc
+                    face_crop = image[top:bottom, left:right]
+                    augmented = apply_augmentations(face_crop)
+                    for j, aug in enumerate(augmented):
+                        aug_name = f"{os.path.splitext(img_name)[0]}_face{i}_aug{j}.jpg"
+                        cv2.imwrite(os.path.join(out_folder, aug_name), aug)
+            else:
+                # Full image
+                augmented = apply_augmentations(image)
+                for j, aug in enumerate(augmented):
+                    aug_name = f"{os.path.splitext(img_name)[0]}_aug{j}.jpg"
+                    cv2.imwrite(os.path.join(out_folder, aug_name), aug)
 
-        for idx, filename in enumerate(os.listdir(input_path)):
-            if filename.lower().endswith(('.jpg', '.jpeg', '.png')):
-                img_path = os.path.join(input_path, filename)
-                img = cv2.imread(img_path)
+    print(f"[INFO] Augmented dataset saved to {output_dir}")
 
-                if img is not None:
-                    apply_augmentations(img, idx, filename, output_path)
-
-print("✅ Done! All people’s augmented images are ready.")
+if __name__ == "__main__":
+    augment_faces()

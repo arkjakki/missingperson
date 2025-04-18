@@ -1,39 +1,34 @@
 import face_recognition
 import os
-import cv2
 import pickle
 
-# Paths
-BASE_DIR = 'dataset'
-ENCODING_FILE = 'face_encodings.pkl'
+DATASET_DIR = "dataset"
+ENCODED_DIR = "encoded_faces"
+
+os.makedirs(ENCODED_DIR, exist_ok=True)
 
 known_encodings = []
 known_names = []
 
-print("🔍 Encoding faces...")
-
-# Go through each augmented folder
-for person_folder in os.listdir(BASE_DIR):
-    if not person_folder.endswith('_augmented'):
+for person_name in os.listdir(DATASET_DIR):
+    person_folder = os.path.join(DATASET_DIR, person_name)
+    if not os.path.isdir(person_folder):
         continue
-    
-    person_name = person_folder.replace('_augmented', '').upper()
-    folder_path = os.path.join(BASE_DIR, person_folder)
-    
-    for filename in os.listdir(folder_path):
-        img_path = os.path.join(folder_path, filename)
-        img = cv2.imread(img_path)
 
-        if img is None:
+    for image_name in os.listdir(person_folder):
+        image_path = os.path.join(person_folder, image_name)
+        image = face_recognition.load_image_file(image_path)
+        face_locations = face_recognition.face_locations(image)
+        if not face_locations:
             continue
 
-        encodings = face_recognition.face_encodings(img)
-        if encodings:
-            known_encodings.append(encodings[0])
-            known_names.append(person_name)
+        encoding = face_recognition.face_encodings(image, face_locations)[0]
+        known_encodings.append(encoding)
+        known_names.append(person_name)
 
-# Save to pickle
-with open(ENCODING_FILE, 'wb') as f:
-    pickle.dump({'encodings': known_encodings, 'names': known_names}, f)
+data = {"encodings": known_encodings, "names": known_names}
 
-print(f"✅ Encoded {len(known_encodings)} faces and saved to '{ENCODING_FILE}'")
+with open(os.path.join(ENCODED_DIR, "encodings.pkl"), "wb") as f:
+    pickle.dump(data, f)
+
+print(f"[INFO] Encoded {len(known_names)} faces from {len(set(known_names))} people.")
